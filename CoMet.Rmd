@@ -1,0 +1,1397 @@
+---
+title: "Exploratory analysis for Comparative Metataxonomy"
+author: "Roberto Siani"
+date: "24.06.21"
+
+---
+
+AUTHOR NOTES:
+
+This script is highly opinionated (choice of tools, normalization methods, decontamination methods, palettes, themes ...). It's up to you to use it as it is or modify it as it best suits you (implying, you will have to look into the code and make those changes, unless we all agree that the script could benefit from them).
+
+I do my best to make sure results from these analyses can be trusted, but keep your eyes open and report any suspected mistake. I will be happy to take care of it as soon as possible.
+
+# SETUP
+
+Set up working environment: packages and default graphic themes.
+
+```{r, cache = TRUE, echo = FALSE, include = FALSE}
+
+# pacman to install and load libraries
+
+if (!require("pacman")) install.packages(
+  "pacman",
+  verbose = F)
+
+# BiocManager for Bioconductor libraries
+
+if (!require("BiocManager")) install.packages(
+  "BiocManager",
+  verbose = F)
+
+# devtools for GitHub repositories 
+
+if (!require("devtools")) install.packages(
+  "devtools",
+  verbose = F)
+
+# GitHub libraries
+
+pacman::p_load_gh(
+  "jbisanz/qiime2R",
+  "benjjneb/decontam",
+  "mikemc/speedyseq",
+  "adw96/breakaway",
+  "adw96/DivNet")
+
+# install/load the remainder of libraries
+
+pacman::p_load(
+  tidyverse,
+  vegan,
+  ape,
+  microbiome,
+  DESeq2,
+  ggpubr,
+  patchwork,
+  hrbrthemes,
+  SRS,
+  phangorn,
+  DECIPHER,
+  MicrobiotaProcess,
+  compositions,
+  hues,
+  zCompositions)
+
+# load sensible themes and palettes
+
+source("~/Desktop/library/scripts/mixed_palette.R")
+
+theme_set(my_theme)
+
+select = dplyr::select
+transform = microbiome::transform
+
+```
+
+# RAW INPUT
+
+## SELECT PATHS
+
+This section let you select the path for your QIIME2 artifacts. You also need to identify your negative controls for the de-contamination step. 
+
+```{r}
+
+# select path to files (easier if the script is always in the same folder as your files)
+
+metadata_table = "../mapping.tsv"
+
+taxonomic_assignment = "OUT_old/taxonomy.tsv"
+
+counts_table = "OUT_old/abundances.tsv"
+
+representative_sequences = "OUT_old/refSeq.fa"
+
+control_samples = "NA"
+
+```
+
+
+## PRE-PROCESS TO PHYLOSEQ OBJECT
+
+This section import the qza and mapping file. The ASVs abundance table is cleaned of contamination and transformed to center log-ratio to account for compositionality of the data. Non-bacterial ASVs are removed and a phyloseq-class object (named "uBiome") is generated to store all the data and locally saved.
+
+
+```{r}
+
+# import Qiime2 results, clean them and integrate in a phyloseq object
+
+# import metadata
+
+metaTab = 
+  read_tsv(metadata_table) %>% 
+  mutate_if(is_character, as.factor)
+
+print(metaTab)
+
+# import and clean taxonomy
+
+pre_taxTab =  
+  read_tsv(taxonomic_assignment) %>% 
+  map_df(~gsub(
+    pattern = "metagenome|uncultured|unidentified|Unknown",
+    replacement = NA,
+    .x)) %>%
+  mutate_if(is_character, str_trim) %>% 
+  mutate(Kingdom = ifelse(is.na(Kingdom),
+                          "U. Kingdom",
+                          Kingdom),
+         Phylum = coalesce(Phylum,
+                           ifelse(grepl("^U.", Kingdom),
+                                  Kingdom,
+                                  paste("U.", Kingdom))),
+         Class = coalesce(Class,
+                          ifelse(grepl("^U.", Phylum),
+                                 Phylum,
+                                 paste("U.", Phylum))),
+         Order = coalesce(Order,
+                          ifelse(grepl("^U.", Class),
+                                 Class,
+                                 paste("U.", Class))),
+         Family = coalesce(Family,
+                           ifelse(grepl("^U.", Order),
+                                  Order,
+                                  paste("U.", Order))),
+         Genus = coalesce(Genus,
+                          ifelse(grepl("^U.", Family),
+                                 Family,
+                                 paste("U.", Family))),
+         Species = coalesce(Species,
+                            ifelse(grepl("^U.", Genus),
+                                   Genus,
+                                   paste("U.", Genus)))) %>% 
+  column_to_rownames("ASV") %>% 
+  filter(Kingdom %in% "Bacteria" &
+           !Genus %in% "Chloroplast" &
+           !Genus %in% "Mitochondria")
+
+print(head(pre_taxTab %>% 
+             as_tibble()))
+
+# import ASVs counts
+
+pre_abuTab = 
+  read_tsv(counts_table) %>% 
+  column_to_rownames("Sample") %>% 
+  t() %>% 
+  as.data.frame()
+  
+
+# prevalence-based clean-up of contaminants 
+
+clean_abuTab = 
+  pre_abuTab[!isContaminant(t(pre_abuTab),
+                            neg = c(colnames(pre_abuTab)
+                                    %in% control_samples),
+                            threshold = .1,
+                            normalize = T,
+                            detailed = F), ] %>%
+  filter() %>%
+  select_if(!names(.) %in% indexing$control_samples) %>%
+  filter(rowSums(.) > 0 &
+           rownames(.) %in% rownames(pre_taxTab))
+
+# centered log-ratio transformation 
+
+clr_abuTab = 
+  clean_abuTab %>% 
+  na_if(0) %>% 
+  replace_na(list(runif(1, min = 0.1, max = 1))) %>% 
+  clr() %>% 
+  as.data.frame() %>% 
+  `rownames<-`(rownames(clean_abuTab))
+
+print(head(abuTab %>% 
+       as_tibble()))
+
+srs_abuTab = 
+  clean_abuTab %>% 
+  SRS(Cmin = min(colSums(.))) %>% 
+  `rownames<-`(rownames(clean_abuTab))
+
+raw_abuTab = 
+  clean_abuTab
+
+# final filtering of taxa table
+
+taxTab = 
+  pre_taxTab %>%
+  filter(rownames(.) %in%
+           rownames(raw_abuTab)) %>% 
+  as.matrix()
+
+# import representative sequences
+
+seqsTab = 
+  readDNAStringSet(representative_sequences)
+
+# multi-alignment to predict phylogenetic tree
+
+treeObj = 
+  phyDat(
+    as(
+      AlignSeqs(seqsTab,
+                anchor = NA,
+                verbose = F),
+      "matrix"),
+    type = "DNA") %>%
+  pml(
+    dist.ml(.) %>%
+      NJ(),
+    data = .)
+
+# generate report
+
+report = 
+  data.frame(
+    raw = 
+      c(colSums(pre_abuTab), ASVs = nrow(pre_abuTab)),
+    cleaned = 
+      c(colSums(raw_abuTab), ASVs = nrow(raw_abuTab)),
+    filtered = 
+      c(colSums(pre_abuTab) - colSums(clean_abuTab), ASVs = NA),
+    transformed = 
+      c(colSums(abuTab), ASVs = nrow(abuTab)),
+    normalized = 
+      c(colSums(srs_abuTab), ASVs = nrow(srs_abuTab)))
+
+report_long = 
+  report[-nrow(report), -4] %>% 
+  rownames_to_column("samples") %>% 
+  pivot_longer(-samples,
+               values_to = "reads",
+               names_to = "step",
+               names_ptypes = factor()) %>% 
+  mutate(step = fct_relevel(step, 
+                            "raw",
+                            "cleaned",
+                            "filtered",
+                            "normalized"))
+
+# create directory for results
+#dir.create("OUT")
+
+cairo_pdf(file = "OUT/preprocessing_report.pdf",
+          width = 16,
+          height = 9)
+report_long %>% 
+  ggplot() +
+  geom_bar(
+    aes(x = samples,
+        y = reads,
+        fill = step,
+        color = step),
+    stat = "identity",
+    position = "dodge") +
+  scale_fill_manual(
+    values = c("#05668d","#028090","#00a896","#02c39a")) +
+  scale_color_manual(
+    values = c("#05668d","#028090","#00a896","#02c39a")) +
+  theme(
+    axis.text.x = element_text(angle = 15)) +
+  geom_hline(
+    yintercept = min(colSums(alt_abuTab)),
+    size = 0.2,
+    color = "#8d2c05") +
+  scale_y_continuous(
+    breaks = seq(min(report_long$reads),
+                 max(report_long$reads),
+                 by = max(report_long$reads)/5),
+                     labels = scales::scientific) +
+  labs(title = format(Sys.Date(), "%d %b %Y"))
+dev.off()
+
+
+
+# import into phyloseq-object
+
+uBiome =  
+  phyloseq(
+    otu_table(abuTab,
+              taxa_are_rows = T),
+    tax_table(taxTab),
+    sample_data(metaTab %>% 
+                  column_to_rownames("sample-id")),
+    refseq(seqsTab),
+    phy_tree(treeObj$tree))
+
+# save phyloseq-class object
+
+save(uBiome,
+     file = paste("uBiome",
+                  format(Sys.time(), "_%d%m%y_%H%M"),
+                  ".RData",
+                  sep = ""))
+
+
+```
+
+# REFINED INPUT
+
+Congratulations, now that you have your phyloseq object prepared, you can finally start to explore the microbial wonderland in your samples
+
+```{r, echo = FALSE, include = FALSE}
+
+# load your uBiome dataset
+
+load("~/Desktop/2021_06_17_David/test_01/uBiome_070821_1849.RData")
+
+# again, take a good look at your results. Look at the sparsity and the percentage of singletons, select your variables of interest
+
+summarize_phyloseq(uBiome)
+
+variables_of_interest = c("Description", "Timepoint")
+
+# here is your control station for your grouping variables and respective reference levels (baseline for statistical testing)
+
+variables_list = 
+  meta(uBiome) %>%
+  select(all_of(variables_of_interest)) %>%
+  map(~levels(.x))
+
+# generate palettes for all variables (check ?get_palette to see the available palette or define your own with a vector of hex codes)
+# ps. the palette picking is random. It is unlikely that you get the same palettes when you have a lower amount of variables, but just in case, check and reshuffle
+
+set.seed(16)
+palette_list =
+  map(.x = variables_list,
+      .f = ~{
+        get_palette(
+          pluck(michelangelo,
+                sample(1:length(michelangelo),
+                       1,
+                       replace = F)),
+          length(.x))})
+
+# you can check your palette list here. If you don't like them, change seed and shuffle
+
+map(palette_list,
+    ~swatches::show_palette(.x))
+
+## check your samples and groups
+
+table(meta(uBiome)$Timepoint, meta(uBiome)$Description)
+
+## subset for comparisons
+
+uBiome_nto = 
+  uBiome %>%  
+  subset_samples(Timepoint != "T0") %>%
+  prune_taxa(taxa_sums(.) > 0, .)
+
+uBiome_t2 =
+  uBiome %>% 
+  subset_samples(Timepoint == "T2") %>% 
+  prune_taxa(taxa_sums(.) > 0, .)
+
+```
+
+# OUTPUT 
+
+## MICROBIOME OVERVIEW
+
+### General stats
+
+```{r}
+
+sum_df =
+  uBiome %>%
+  transform("clr") %>%
+  psmelt() %>%
+  group_by_at(vars(-Abundance, -Sample, -read_file, -Timepoint, -Description)) %>%
+  summarise(CLR_mean = mean(Abundance),
+            CLR_SD = sd(Abundance)) %>% 
+  ungroup() %>% 
+  mutate(totalAbundance = taxa_sums(uBiome %>% 
+                                      transform("clr")),
+         Prevalence = 
+           prevalence(uBiome,
+                      detection = 1/100))
+
+plot_1 = 
+  ggplot(sum_df,
+         aes(x = CLR_mean,
+             y = CLR_SD,
+             color = Phylum)) +
+  geom_point(aes(size = totalAbundance,
+                 alpha = Prevalence)) +
+  theme(legend.position = "none") +
+  scale_color_iwanthue(hmin = 0,
+                       hmax = 360,
+                       cmin = 20,
+                       cmax = 50,
+                       lmin = 50,
+                       lmax = 100) +
+  facet_wrap(~Phylum) +
+  scale_size_continuous(range = c(1, 3))
+
+cairo_pdf("OUT/overlook.pdf",
+          width = 24,
+          height = 16)
+plot_1 | plot_2
+dev.off()
+
+```
+
+
+### Taxa frequency
+
+```{r}
+
+plotTaxaFrequency = function() {
+
+  frequency_list = tax_table(uBiome) %>%
+    as.data.frame() %>%
+    map(~table(.x))
+
+  ranks = rank_names(uBiome) %>%
+    set_names()
+
+  ranks = ranks[!ranks %in% "Kingdom"]
+
+  plotter = function(x) {
+    ggplot(frequency_list[[x]] %>%
+         as.data.frame(),
+       aes(x = reorder(.x, Freq),
+           y = Freq,
+           fill = .x)) +
+  geom_bar(stat = "identity") +
+  theme(legend.position = "none") +
+      scale_fill_iwanthue(hmin = 0,
+                          hmax = 360,
+                          cmin = 20,
+                          cmax = 50,
+                          lmin = 25,
+                          lmax = 100) +
+  coord_flip() +
+      labs(y = "Taxa frequency",
+       x = x)
+  }
+
+  map(ranks,
+      ~plotter(.x))
+}
+
+taxaFrequency = plotTaxaFrequency()
+
+# to visualize a specific plot
+
+taxaFrequency[["Phylum"]]
+
+# save all in a pdf
+
+cairo_pdf("OUT/taxaFrequency.pdf",
+    width = 16,
+    height = 16,
+    onefile = T)
+taxaFrequency
+dev.off()
+
+```
+
+### Phylogenetic Tree
+
+```{r}
+
+plotPhylogeneticTree = function(groupingVariable) {
+
+  ranks = rank_names(uBiome) %>%
+    set_names()
+
+  ranks = ranks[!ranks %in% "Kingdom"]
+
+  uBiome = uBiome %>%
+ prune_taxa(core_members(.,
+                         detection = 1/100,
+                         prevalence = 10/100),
+            .)
+
+  plotter = function(x) {
+
+    uBiome %>%
+      tax_glom(ranks[[x]]) %>%
+      plot_tree(label.tips = ranks[[x]],
+                color = "Phylum",
+                plot.margin = 0.1,
+                size = "abundance",
+                shape = groupingVariable,
+                ladderize = T) +
+      labs(title = ranks[[x]]) +
+      scale_fill_iwanthue(hmin = 0,
+                          hmax = 360,
+                          cmin = 20,
+                          cmax = 50,
+                          lmin = 25,
+                          lmax = 100)
+  }
+  
+  map(ranks,
+      ~plotter(.x))
+}
+
+
+phylogeneticTrees = plotPhylogeneticTree("Description")
+
+# to visualize a specific plot
+
+phylogeneticTrees[["Phylum"]]
+
+# save all in a pdf
+
+cairo_pdf("OUT/phylogeneticTrees.pdf",
+    width = 16,
+    height = 16,
+    onefile = T)
+phylogeneticTrees
+dev.off()
+
+```
+
+### Relative Abundance
+
+```{r}
+
+plotRelativeAbundance = function(groupingVars,
+                                 groupingVars2,
+                                 thresh) {
+  
+  ranks = rank_names(uBiome) %>%
+    set_names()
+  
+  ranks = ranks[!ranks %in% "Kingdom" &
+                  !ranks %in% "Species"]
+  
+  melted =
+    uBiome %>% 
+    microbiome::transform("compositional") %>% 
+    psmelt() %>% 
+    pivot_longer(cols = (ncol(.) - 6):ncol(.),
+                 names_to = "ranks",
+                 values_to = "taxa") %>%
+    mutate(taxa = case_when(
+      Abundance >= quantile(Abundance, thresh) ~ taxa,
+      Abundance < quantile(Abundance, thresh) ~ paste("below q", thresh, sep = ""))) %>% 
+    group_by(ranks, 
+             taxa, 
+             across({{groupingVars}}), 
+             across({{groupingVars2}})) %>% 
+    summarise(Abundance = mean(Abundance))
+  
+  plotter = function(x) {
+  ggplot(melted %>% 
+           filter(ranks %in% x)) +
+      geom_bar(stat = "identity",
+               position = "fill",
+               aes_(x = as.name(groupingVars),
+                   y = ~Abundance,
+                   fill = ~taxa)) +
+      scale_fill_iwanthue(hmin = 0,
+                          hmax = 360,
+                          cmin = 20,
+                          cmax = 50,
+                          lmin = 25,
+                          lmax = 100,
+                          random = T) +
+      facet_grid(reformulate(groupingVars2),
+                 scales = "free_x",
+                 space = "free_x") +
+      labs(y = "Relative abundance",
+           x = groupingVars) +
+      guides(fill = 
+               guide_legend(label.theme = element_text(size = 12),
+                            keyheight = 0.8,
+                            keywidth = 0.8,
+                            nrow = ifelse(length(unique(melted[melted$ranks == x,]$taxa)) < 50,
+                                          length(unique(melted[melted$ranks == x,]$taxa)),
+                                          50))) +
+      theme(legend.position = "right",
+            axis.title.x = element_blank(),
+            legend.key = element_rect(size = 0,
+                                      linetype = 0))
+  }
+  
+  map(ranks,
+      ~plotter(.x))
+}
+
+relativeAbundance = plotRelativeAbundance("Description",
+                                          "Timepoint",
+                                          0.90)
+
+# to visualize a specific plot
+
+relativeAbundance[["Order"]]
+
+a# save all in a pdf
+
+cairo_pdf("OUT/relativeAbundance.pdf",
+    width = 16,
+    height = 16,
+    onefile = T)
+relativeAbundance
+dev.off()
+
+```
+
+
+## DIVERSITY
+
+### Richness and Alpha Diversity
+
+Here we switch from plug-in to estimated measures of diversity and richness
+
+```{r}
+
+## richness estimates
+
+res_breakaway =
+  breakaway(uBiome)
+
+a = ggplot() +
+  geom_point(data = meta(uBiome) %>% 
+                 rownames_to_column("sample_names") %>% 
+                 left_join(summary(res_breakaway),
+                           by = "sample_names") %>% 
+                 group_by(Description, Timepoint) %>% 
+                 summarise(estimate = mean(estimate),
+                         error = mean(error),
+                         lower = mean(lower),
+                         upper = mean(upper)),
+               aes(x = Description,
+                   y = estimate,
+                   color = Description),
+             size = 9,
+             shape = 20) +
+  geom_segment(data = meta(uBiome) %>% 
+                 rownames_to_column("sample_names") %>% 
+                 left_join(summary(res_breakaway),
+                           by = "sample_names") %>% 
+                 group_by(Description, Timepoint) %>% 
+                 summarise(estimate = mean(estimate),
+                         error = mean(error),
+                         lower = mean(lower),
+                         upper = mean(upper)),
+               aes(x = Description,
+                   xend = Description,
+                   y = upper,
+                   yend = lower,
+                   color = Description),
+               size = 3,
+               lineend = "round",
+               alpha = 2/3) +
+  facet_grid(~Timepoint,
+             space = "free",
+             scales = "free_x") +
+  scale_color_manual(values = palette_list$Description) +
+  ylab("breakaway estimate") +
+  theme(legend.position = "bottom",
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        panel.grid.major.x = element_blank())
+
+## diversity estimates
+
+des_mat = 
+  diag(nrow(uBiome@sam_data)) %>% 
+  `colnames<-`(as.character(1:ncol(.))) %>% 
+  `rownames<-`(as.character(1:ncol(.)))
+
+set.seed(666)
+
+res_divnet = 
+  uBiome %>% 
+  divnet(des_mat,
+         ncores = 8,
+         tuning = "fast")
+
+
+alpha_diversity_estimates =
+  map(c("shannon", "simpson") %>% 
+        set_names(),
+      ~res_divnet %>% 
+        pluck(.x) %>%
+        summary %>% 
+        left_join(meta(uBiome) %>% 
+                    rownames_to_column("sample_names"),
+                  by = "sample_names"))
+
+b = ggplot(data = alpha_diversity_estimates$shannon,
+               aes(x = Description,
+                   y = estimate,
+                   fill = Description)) +
+  geom_boxplot(size = 0.5) +
+  scale_fill_manual(values = palette_list$Description) +
+  ylab("shannon estimate") +
+  theme(legend.position = "bottom",
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  geom_signif(comparisons = list(c("Control", "Treatment")),
+              map_signif_level = F,
+              tip_length = 0,
+              test = "wilcox.test") +
+  facet_grid(~Timepoint,
+             space = "free",
+             scales = "free_x")
+
+c = ggplot(data = alpha_diversity_estimates$simpson,
+               aes(x = Description,
+                   y = estimate,
+                   fill = Description)) +
+  geom_boxplot(size = 0.5) +
+  scale_fill_manual(values = palette_list$Description) +
+  ylab("simpson estimate") +
+  theme(legend.position = "bottom",
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  geom_signif(comparisons = list(c("Control", "Treatment")),
+              map_signif_level = F,
+              tip_length = 0,
+              test = "wilcox.test") +
+  facet_grid(~Timepoint,
+             space = "free",
+             scales = "free_x")
+
+plot_diversity = 
+  b + c +
+  plot_layout(guides = "collect")
+
+cairo_pdf("OUT/alphaDiversity.pdf",
+          width = 16,
+          height = 16,
+          onefile = T)
+plot_diversity
+dev.off()
+
+## hypothesis testing
+
+res_simpson = 
+  testDiversity(res_divnet,
+                h0 = "simpson")
+
+res_shannon = 
+  testDiversity(res_divnet,
+                h0 = "simpson")
+
+
+```
+
+### Beta Diversity
+
+```{r}
+
+
+## DivNet hypothesis testing
+
+source("~/Desktop/library/scripts/helper_testBeta.R")
+
+bc_test = 
+  testBetaDiversity(res_divnet,
+                    h0 = "bray-curtis",
+                    n_boot = 10e3,
+                    sample_specimen_matrix = res_divnet$X,
+                    groups = sample_data(uBiome_t2)$Description)
+
+
+bc_test$p_value ## 0.76
+
+euc_test = 
+  testBetaDiversity(res_divnet,
+                    h0 = "euclidean",
+                    n_boot = 999,
+                    sample_specimen_matrix = res_divnet$X,
+                    groups = meta(uBiome)$Description)
+  
+euc_test$p_value
+
+ait_test =
+  testBetaDiversity(res_divnet,
+                    h0 = "aitchison",
+                    sample_specimen_matrix = res_divnet$X,
+                    n_boot = 999,
+                    groups = meta(uBiome)$Description)
+
+ait_test$p_value
+
+## Principal Component Analysis
+
+p_load(FactoMineR, factoextra)
+
+
+res_pca = 
+  PCA(uBiome_nto %>% 
+        abundances("clr") %>% 
+        t(),
+      scale.unit = F,
+      graph = F,
+      ncp = 3)
+
+fviz_eig(res_pca,
+         geom = "line",
+         barcolor = "#006666",
+         addlabels = T)
+
+ind = get_pca_ind(res_pca)$coord %>% 
+  as.data.frame() %>% 
+  mutate(sample_names = rownames(.)) %>% 
+  left_join(meta(uBiome) %>% 
+              rownames_to_column("sample_names"))
+
+a = ind %>% 
+  ggplot(
+    aes(x = Dim.3,
+        y = Dim.2)) +
+  geom_point(
+    aes(group = Description,
+        color = Description,
+        shape = Timepoint,
+        size = Dim.1,
+        alpha = Dim.1)) +
+  scale_size_continuous(range = c(3, 9)) +
+  stat_ellipse(linetype = 0,
+               geom = "polygon",
+               type = "norm",
+               alpha = 0.05,
+               aes(fill = Description)) +  
+  scale_color_manual(values = palette_list$Description) +
+  scale_fill_manual(values = palette_list$Description) +
+  labs(x = paste("Dim. 3,", round(res_pca$eig[3, 2], 1)),
+       y = paste("Dim. 2,", round(res_pca$eig[2, 2], 1)),
+       subtitle = paste("Dim. 1,", round(res_pca$eig[1, 2], 1))) +
+  theme(legend.position = "right") 
+
+c = ind %>% 
+  ggplot(
+    aes(x = Dim.1,
+        y = Dim.2)) +
+  geom_point(
+    aes(group = Description,
+        color = Description,
+        shape = Timepoint,
+        size = Dim.3,
+        alpha = Dim.3)) +
+  scale_size_continuous(range = c(3, 9)) +
+  stat_ellipse(linetype = 0,
+               geom = "polygon",
+               type = "norm",
+               alpha = 0.05,
+               aes(fill = Description)) +  
+  scale_color_manual(values = palette_list$Description) +
+  scale_fill_manual(values = palette_list$Description) +
+  labs(x = paste("Dim. 1,", round(res_pca$eig[1, 2], 1)),
+       y = paste("Dim. 2,", round(res_pca$eig[2, 2], 1)),
+       subtitle = paste("Dim. 3,", round(res_pca$eig[3, 2], 1))) +
+  theme(legend.position = "right") 
+
+cntrb = rbind(get_pca_var(res_pca)$contrib %>% 
+                as.data.frame() %>%
+                slice_max(Dim.1, n = 2), 
+              get_pca_var(res_pca)$contrib %>% 
+                as.data.frame() %>%
+                slice_max(Dim.2, n = 2),
+              get_pca_var(res_pca)$contrib %>% 
+              as.data.frame() %>% 
+                slice_max(Dim.3, n = 2)) %>% 
+ rownames_to_column("ASVs") %>% 
+  left_join(tax_table(uBiome_nto) %>% 
+              as.data.frame() %>% 
+              select(Order) %>% 
+              rownames_to_column("ASVs")) %>% 
+  pivot_longer(-c(Order, ASVs), 
+               names_to = "Dimension",
+               values_to = "Contribution")
+
+b = ggbarplot(cntrb,
+              x = "Order",
+              y = "Contribution",
+              fill = "Dimension",
+              position = position_dodge(),
+              size = 0,
+              width = 1,
+              orientation  = "horizontal",
+              alpha = 0.75,
+              palette = c("#00589B", "#00A0B0", "#CF5C78")) +
+  theme_ipsum(plot_margin = margin(0, 0, 0, 0),
+              base_size = 15,
+              axis_title_size = 20) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        legend.title = element_blank(),
+        panel.grid.major.y = element_blank())
+  
+b = a / c + 
+  plot_layout(heights = c(1, 1))
+
+c | (relativeAbundance[["Order"]] +
+  theme(axis.text.x = element_text(angle = 15,
+                                   size = 15)))
+## NON-METRIC MULTIDIMENSIONAL SCALING
+
+res_nmds = 
+  ordinate(uBiome %>% 
+             subset_samples(Timepoint != "T0"),
+           method = "NMDS",
+           distance = "bray",
+           autotransform = T,
+           try = 999)
+
+res_nmds %>% 
+  scores() %>% 
+  as.data.frame() %>% 
+  rownames_to_column("sample_names") %>% 
+  left_join(meta(uBiome) %>% 
+              rownames_to_column("sample_names")) %>% 
+  left_join(combined_simpson) %>% 
+  ggplot(
+    aes(x = NMDS1,
+        y = NMDS2)) +
+  geom_point(
+    aes(group = Description,
+        color = Description,
+        shape = Timepoint,
+        size = estimate)) +
+  scale_size_continuous(range = c(3, 9)) +
+  stat_ellipse(linetype = 0,
+               geom = "polygon",
+               type = "t",
+               alpha = 0.05,
+               aes(fill = Description)) +  
+  scale_color_manual(values = palette_list$Description) +
+  scale_fill_manual(values = palette_list$Description) +
+  labs(subtitle = paste("Stress:", round(res_nmds$stress, 2))) +
+  theme(legend.position = "right") 
+
+## SVD
+
+res_prcomp =
+  prcomp(
+    uBiome %>% 
+      abundances("clr") %>% 
+      t(),
+    center = F,
+    scale. = F)
+
+res_prcomp$x %>% 
+  as.data.frame() %>% 
+  rownames_to_column("sample_names") %>% 
+  left_join(meta(uBiome) %>% 
+              rownames_to_column("sample_names")) %>% 
+  ggplot(
+    aes(x = PC1,
+        y = PC2)) +
+  geom_point(
+    aes(group = Description,
+        color = Description,
+        shape = Timepoint,
+        size = PC3,
+        alpha = PC3)) +
+  scale_size_continuous(range = c(3, 9)) +
+  stat_ellipse(linetype = 0,
+               geom = "polygon",
+               type = "norm",
+               alpha = 0.05,
+               aes(fill = Description)) +  
+  scale_color_manual(values = palette_list$Description) +
+  scale_fill_manual(values = palette_list$Description) +
+  labs(x = paste("Dim. 1,", round(res_prcomp$sdev[1]^2/sum(res_prcomp$sdev^2),2)),
+       y = paste("Dim. 2,", round(res_prcomp$sdev[2]^2/sum(res_prcomp$sdev^2),2))) +
+  theme(legend.position = "right")
+
+```
+
+## MULTIVARIATE TESTING
+
+### PERMANOVA
+
+```{r}
+
+# to run permanova, just insert your variables of interest in the formula
+
+set.seed(1)
+res.permanova = adonis(
+  t(abundances(uBiome_nto)) ~ Description + Timepoint,
+  data = meta(uBiome_nto),
+  permutations = 30,
+  method = "manhattan")
+
+res.permanova
+
+```
+
+## DIFFERENTIAL ABUNDANCE
+
+### ALDEx2
+
+```{r}
+
+p_load(ALDEx2)
+
+aldex_treatment =
+  aldex(uBiome_nto %>% 
+          abundances(),
+        meta(uBiome_nto)$Description,
+        effect = T,
+        include.sample.summary = T,
+        denom = "all",
+        mc.samples = 128)
+
+ALDEx2_to_plot =
+  aldex_treatment %>%
+  rownames_to_column("OTU") %>%
+  mutate(
+    Significance = factor(
+      case_when(
+        wi.eBH > 0.05 ~ "ns",
+        wi.eBH <= 0.05 & wi.eBH > 0.01 ~ "*",
+        wi.eBH <= 0.01 & wi.eBH > 0.001 ~ "**",
+        wi.eBH <= 0.001 & wi.eBH > 0.0001 ~ "***",
+        wi.eBH <= 0.0001 ~ "****"
+      ))) %>%
+  left_join(tax_table(uBiome_nto) %>%
+              as.data.frame() %>%
+              rownames_to_column("OTU"),
+            by = "OTU") %>%
+  left_join(uBiome_nto %>%
+              transform("compositional") %>%
+              psmelt() %>%
+              group_by(OTU) %>%
+              summarise(baseMean = mean(Abundance)),
+            by = "OTU")
+
+plot_treatment =
+  ggplot(ALDEx2_to_plot) +
+  geom_jitter(
+    aes(x = Order,
+        y = effect,
+        colour = Significance,
+        size = baseMean),
+    alpha = 2/3,
+    width = 0.25,
+    height = 0.05) +
+  theme(axis.text.x = element_text(angle = 45.0, vjust = 1, hjust = 1,
+                                   size = 10),
+        axis.title.x = element_blank()) +
+  scale_color_manual(values = michelangelo$spring) +
+  guides(colour = guide_legend(override.aes = list(size = 5))) +
+  ylab(expression(paste("Effect size"))) +
+  labs(title = "ALDEx2: DA by Treatment")
+
+plot_treatment2 =
+  ggplot(ALDEx2_to_plot) +
+  geom_point(
+    aes(x = diff.btw,
+        y = diff.win,
+        color = Significance,
+        size = baseMean,
+        alpha = abs(effect))) +
+  scale_color_manual(values = michelangelo$spring) +
+  guides(colour = guide_legend(override.aes = list(size = 5))) +
+  labs(x = "Dispersion",
+       y = "Difference")
+
+plot_treatment | plot_treatment2
+
+## model matrix
+
+cov_matrix =
+  model.matrix(~ Description + Timepoint, data = meta(uBiome_nto))
+
+## calculate central-log ratio transformation
+
+aldex_clr =
+  aldex.clr(uBiome_nto %>%
+              abundances(),
+            cov_matrix,
+            denom = "all",
+            mc.samples = 128,
+            useMC = T,
+            verbose = T)
+
+res_glm =
+  aldex.glm(aldex_clr,
+            verbose = T)
+
+glm_effect =
+  aldex.glm.effect(aldex_clr,
+                   include.sample.summary = T,
+                   useMC = T,
+                   verbose = T)
+## plotting
+
+ALDEx2_to_plot =
+  res_glm %>%
+  rownames_to_column("OTU") %>%
+  left_join(glm_effect$DescriptionTreatment %>%
+              rownames_to_column("OTU"),
+            by = "OTU") %>%
+  left_join(glm_effect$TimepointT2 %>%
+              rownames_to_column("OTU"),
+            by = "OTU",
+            suffix = c("Description", "Timepoint")) %>%
+  mutate(
+    SignificanceTreatment = factor(
+      case_when(
+        `model.DescriptionTreatment Pr(>|t|).BH` > 0.05 ~ "ns",
+        `model.DescriptionTreatment Pr(>|t|).BH` <= 0.05 & `model.DescriptionTreatment Pr(>|t|).BH` > 0.01 ~ "*",
+        `model.DescriptionTreatment Pr(>|t|).BH` <= 0.01 & `model.DescriptionTreatment Pr(>|t|).BH` > 0.001 ~ "**",
+        `model.DescriptionTreatment Pr(>|t|).BH` <= 0.001 & `model.DescriptionTreatment Pr(>|t|).BH` > 0.0001 ~ "***",
+        `model.DescriptionTreatment Pr(>|t|).BH` <= 0.0001 ~ "****"
+      )),
+    SignificanceTimepoint = factor(
+      case_when(
+        `model.TimepointT2 Pr(>|t|).BH` > 0.05 ~ "ns",
+        `model.TimepointT2 Pr(>|t|).BH` <= 0.05 & `model.TimepointT2 Pr(>|t|).BH` > 0.01 ~ "*",
+        `model.TimepointT2 Pr(>|t|).BH` <= 0.01 & `model.TimepointT2 Pr(>|t|).BH` > 0.001 ~ "**",
+        `model.TimepointT2 Pr(>|t|).BH` <= 0.001 & `model.TimepointT2 Pr(>|t|).BH` > 0.0001 ~ "***",
+        `model.TimepointT2 Pr(>|t|).BH` <= 0.0001 ~ "****"
+      ))) %>%
+  left_join(tax_table(uBiome_nto) %>%
+              as.data.frame() %>%
+              rownames_to_column("OTU"),
+            by = "OTU") %>%
+  left_join(uBiome_nto %>%
+              transform("compositional") %>%
+              psmelt() %>%
+              group_by(OTU) %>%
+              summarise(baseMean = mean(Abundance)),
+            by = "OTU")
+
+plot_treatment =
+  ggplot(ALDEx2_to_plot) +
+  geom_jitter(
+    aes(x = Order,
+        y = effectDescription,
+        colour = SignificanceTreatment,
+        size = baseMean),
+    alpha = 2/3,
+    width = 0.25,
+    height = 0.05) +
+  theme(axis.text.x = element_text(angle = 45.0, vjust = 1, hjust = 1,
+                                   size = 10),
+        axis.title.x = element_blank()) +
+  scale_color_manual(values = michelangelo$spring) +
+  guides(colour = guide_legend(override.aes = list(size = 5))) +
+  ylab(expression(paste("Effect size"))) +
+  labs(title = "ALDEx2: DA by Treatment")
+
+plot_treatment2 =
+  ggplot(ALDEx2_to_plot) +
+  geom_point(
+    aes(x = diff.btwDescription,
+        y = diff.winDescription,
+        color = SignificanceTreatment,
+        size = baseMean,
+        alpha = abs(effectDescription))) +
+  scale_color_manual(values = michelangelo$spring) +
+  labs(x = "Dispersion",
+       y = "Difference")
+
+plot_timepoint =
+  ggplot(ALDEx2_to_plot) +
+  geom_jitter(
+    aes(x = Order,
+        y = effectTimepoint,
+        colour = SignificanceTimepoint,
+        size = baseMean),
+    alpha = 2/3,
+    width = 0.25,
+    height = 0.05) +
+  theme(axis.text.x = element_text(angle = 45.0, vjust = 1, hjust = 1,
+                                   size = 10),
+        axis.title.x = element_blank()) +
+  scale_color_manual(values = michelangelo$summer) +
+  guides(colour = guide_legend(override.aes = list(size = 5))) +
+  ylab(expression(paste("Effect size"))) +
+  labs(title = "ALDEx2: DA by Timepoint")
+
+plot_timepoint2 =
+  ggplot(ALDEx2_to_plot) +
+  geom_point(
+    aes(x = diff.btwTimepoint,
+        y = diff.winTimepoint,
+        color = SignificanceTimepoint,
+        size = baseMean,
+        alpha = abs(effectTimepoint))) +
+  scale_color_manual(values = michelangelo$summer) +
+  labs(x = "Dispersion",
+       y = "Difference")
+(plot_treatment / plot_treatment2) | (plot_timepoint / plot_timepoint2)
+
+cairo_pdf("OUT/diffAbundance.pdf",
+          width = 24,
+          height = 16,
+onefile = T)
+(plot_treatment / plot_treatment2) | (plot_timepoint / plot_timepoint2)
+dev.off()
+
+```
+s
+
+### ANCOM
+
+```{r}
+
+source("~/Desktop/library/scripts/ancom_v2.1.R")
+
+ancom_preProc = 
+  feature_table_pre_process(uBiome_nto %>% 
+                              abundances("shift"),
+                            meta(uBiome_nto) %>% 
+                              rownames_to_column("sample_names"),
+                            "sample_names",
+                            "Description",
+                            out_cut = 0.05,
+                            zero_cut = 0.90,
+                            lib_cut = 1000,
+                            neg_lb = T)
+
+res_ancom = 
+  ANCOM(ancom_preProc$feature_table,
+        ancom_preProc$meta_data,
+        ancom_preProc$structure_zeros,
+        "Description",
+        p_adj_method = "BH",
+        alpha = 0.05,
+        adj_formula = "Timepoint")
+
+plot_ancom = 
+  res_ancom$fig$data %>% 
+  filter(y != Inf & zero_ind != "Yes") %>% 
+  left_join(res_ancom$out,
+            by = "taxa_id") %>% 
+  mutate(detected_at = case_when(
+    detected_0.9 == T ~ ".9",
+    detected_0.8 == T ~ ".8",
+    detected_0.7 == T ~ ".7",
+    detected_0.6 == T ~ ".6",
+    TRUE ~ "ns")) %>% 
+  left_join(tax_table(uBiome) %>% 
+              data.frame() %>% 
+              rownames_to_column("taxa_id")) %>% 
+  ggplot() +
+  geom_point(
+    aes(x = x,
+        y = y,
+        color = detected_at),
+    shape = 19,
+    size = 3,
+    alpha = 2/3) +
+  geom_text(aes(x = x,
+                y = y,
+                label = ifelse(detected_at != "ns", Genus, "")),
+            hjust = "inward",
+            vjust = "inward",
+            color = "#333333",
+            size = 7) +
+  scale_color_manual(values = michelangelo$summer) +
+  labs(x = "CLR mean difference",
+       y = "W")
+
+plot_2 = 
+  uBiome_nto %>%
+  transform("compositional") %>%
+  speedyseq::psmelt() %>%
+  dplyr::rename(taxa_id = OTU) %>% 
+  group_by_at(vars(-Abundance, -Sample, -read_file, -Timepoint)) %>%
+  summarise(meanRA = mean(Abundance),
+            sdRA = sd(Abundance)) %>% 
+  pivot_wider(values_from = 10:11,
+              names_from = 2) %>% 
+  right_join(res_ancom$fig$data %>% 
+  filter(y != Inf & zero_ind != "Yes") %>% 
+  left_join(res_ancom$out,
+            by = "taxa_id") %>% 
+  mutate(detected_at = case_when(
+    detected_0.9 == T ~ ".9",
+    detected_0.8 == T ~ ".8",
+    detected_0.7 == T ~ ".7",
+    detected_0.6 == T ~ ".6",
+    TRUE ~ "ns")) %>% 
+    filter(detected_at != "ns")) %>% 
+  pivot_longer(cols = 9:12,
+               names_to = c("name","Description"),
+               values_to = "value",
+               names_sep = "_") %>% 
+  pivot_wider(names_from = name,
+              values_from = value) %>% 
+  ggplot(aes(x = Genus,
+             y = meanRA,
+             fill = Description)) +
+  geom_bar(stat = "identity",
+           position = "dodge",
+           size = 0) +
+  scale_fill_manual(values = palette_list$Description) +
+  coord_flip() +
+  theme(axis.title.y = element_blank()) +
+  labs(y = "Mean Relative Abundance")
+
+cairo_pdf("OUT/ANCOM.pdf",
+    width = 16,
+    height = 16,
+    onefile = T)
+plot_ancom / plot_2 + 
+  plot_layout(heights = c(2, 1))
+dev.off()
+
+
+
+```
+
+### DACOM
+
+```{r}
+
+p_load_gh("barakbri/dacomp")
+
+X = t(abundances(uBiome_t2 %>% 
+                   speedyseq::tax_glom("Genus")))
+
+## select reference taxa
+
+selected_references = 
+  dacomp.select_references(
+    X = X)
+
+## validate reference selection
+
+cleaned_references = 
+  dacomp.validate_references(X = X,
+                             Y = sample_data(uBiome_t2)$Description,
+                             ref_obj = selected_references,
+                             test = DACOMP.TEST.NAME.WILCOXON,
+                             Q_validation = 0.1,
+                             Minimal_Counts_in_ref_threshold = 10,
+                             Reduction_Factor = 0.9,
+                             NR_perm = 1000)
+
+## inferece with Wilcoxon rank-sum test
+
+res_dacomp = 
+  dacomp.test(X = X,
+              y = sample_data(uBiome_t2)$Description,
+              ind_reference_taxa = cleaned_references,
+              test = DACOMP.TEST.NAME.WILCOXON,
+              verbose = F,
+              q = 0.1)
+
+res_dacomp
+
+```
+
+## NETWORK INFERENCE
+
+### NETWORKS
+
+```{r}
+
+p_load_gh("stefpeschel/NetCoMi",
+          "vmikk/metagMisc")
+
+uBiome_split = 
+  phyloseq_sep_variable(uBiome_t2,
+                        "Description")
+
+net_ct = 
+  netConstruct(data = uBiome_split$Control,
+               data2 = uBiome_split$Treatment,
+               filtTax = "numbSamp",
+               measure = "spieceasi",
+               zeroMethod = "pseudo",
+               normMethod = "clr",
+               sparsMethod = "t-test",
+               filtTaxPar = list(numbSamp = 2))
+  
+
+```
+
